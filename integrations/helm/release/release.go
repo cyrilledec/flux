@@ -3,17 +3,22 @@ package release
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
+	"net/url"
 	"os"
 	"os/exec"
 	"time"
 
 	"github.com/ghodss/yaml"
 	"github.com/go-kit/kit/log"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/helm/pkg/chartutil"
+	"k8s.io/helm/pkg/getter"
 	k8shelm "k8s.io/helm/pkg/helm"
+	helmenv "k8s.io/helm/pkg/helm/environment"
 	hapi_release "k8s.io/helm/pkg/proto/hapi/release"
 
 	"github.com/weaveworks/flux"
@@ -144,11 +149,28 @@ func (r *Release) Install(chartPath, releaseName string, fhr flux_v1beta1.HelmRe
 
 	// Read values from given valueFile paths (configmaps, etc.)
 	mergedValues := chartutil.Values{}
+	for _, valueFile := range fhr.Spec.ValueFiles {
+		// Read the contents of the file
+		b, err := readFile(valueFile)
+		if err != nil {
+			r.logger.Log("error", fmt.Sprintf("Cannot read value file [%s] for Chart release [%s]: %#v", valueFile, fhr.Spec.ReleaseName, err))
+			return nil, err
+		}
+
+		// Load into values and merge
+		var values chartutil.Values
+		err = yaml.Unmarshal(b, &values)
+		if err != nil {
+			r.logger.Log("error", fmt.Sprintf("Cannot yaml.Unmarshal value file [%s] for Chart release [%s]: %#v", valueFile, fhr.Spec.ReleaseName, err))
+			return nil, err
+		}
+		mergedValues = mergeValues(mergedValues, values)
+	}
 	for _, valueFileSecret := range fhr.Spec.ValueFileSecrets {
 		// Read the contents of the secret
 		secret, err := kubeClient.CoreV1().Secrets(fhr.Namespace).Get(valueFileSecret.Name, v1.GetOptions{})
 		if err != nil {
-			r.logger.Log("error", fmt.Sprintf("Cannot get secret %s for Chart release [%s]: %#v", valueFileSecret.Name, fhr.Spec.ReleaseName, err))
+			r.logger.Log("error", fmt.Sprintf("Cannot get secret [%s] for Chart release [%s]: %#v", valueFileSecret.Name, fhr.Spec.ReleaseName, err))
 			return nil, err
 		}
 
@@ -156,7 +178,7 @@ func (r *Release) Install(chartPath, releaseName string, fhr flux_v1beta1.HelmRe
 		var values chartutil.Values
 		err = yaml.Unmarshal(secret.Data["values.yaml"], &values)
 		if err != nil {
-			r.logger.Log("error", fmt.Sprintf("Cannot yaml.Unmashal values.yaml in secret %s for Chart release [%s]: %#v", valueFileSecret.Name, fhr.Spec.ReleaseName, err))
+			r.logger.Log("error", fmt.Sprintf("Cannot yaml.Unmarshal values.yaml in secret [%s] for Chart release [%s]: %#v", valueFileSecret.Name, fhr.Spec.ReleaseName, err))
 			return nil, err
 		}
 		mergedValues = mergeValues(mergedValues, values)
@@ -273,7 +295,7 @@ func fhrResourceID(fhr flux_v1beta1.HelmRelease) flux.ResourceID {
 }
 
 // Merges source and destination `chartutils.Values`, preferring values from the source Values
-// This is slightly adapted from https://github.com/helm/helm/blob/master/cmd/helm/install.go#L329
+// This is slightly adapted from https://github.com/helm/helm/blob/2332b480c9cb70a0d8a85247992d6155fbe82416/cmd/helm/install.go#L359
 func mergeValues(dest, src chartutil.Values) chartutil.Values {
 	for k, v := range src {
 		// If the key doesn't exist already, then just set the key to that value
@@ -298,6 +320,31 @@ func mergeValues(dest, src chartutil.Values) chartutil.Values {
 		dest[k] = mergeValues(destMap, nextMap)
 	}
 	return dest
+}
+
+// readFile loads a file from a local directory or url.
+// This is slightly adapted from https://github.com/helm/helm/blob/2332b480c9cb70a0d8a85247992d6155fbe82416/cmd/helm/install.go#L552
+func readFile(filePath string) ([]byte, error) {
+	var settings helmenv.EnvSettings
+	flags := pflag.NewFlagSet("helm-env", pflag.ContinueOnError)
+	settings.AddFlags(flags)
+	settings.Init(flags)
+
+	u, _ := url.Parse(filePath)
+	p := getter.All(settings)
+
+	getterConstructor, err := p.ByScheme(u.Scheme)
+
+	if err != nil {
+		return ioutil.ReadFile(filePath)
+	}
+
+	getter, err := getterConstructor(filePath, "", "", "")
+	if err != nil {
+		return []byte{}, err
+	}
+	data, err := getter.Get(filePath)
+	return data.Bytes(), err
 }
 
 // releaseManifestToUnstructured turns a string containing YAML

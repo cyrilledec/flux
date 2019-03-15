@@ -159,6 +159,11 @@ func (in *HelmReleaseList) DeepCopyObject() runtime.Object {
 func (in *HelmReleaseSpec) DeepCopyInto(out *HelmReleaseSpec) {
 	*out = *in
 	in.ChartSource.DeepCopyInto(&out.ChartSource)
+	if in.ValueFiles != nil {
+		in, out := &in.ValueFiles, &out.ValueFiles
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.ValueFileSecrets != nil {
 		in, out := &in.ValueFileSecrets, &out.ValueFileSecrets
 		*out = make([]v1.LocalObjectReference, len(*in))

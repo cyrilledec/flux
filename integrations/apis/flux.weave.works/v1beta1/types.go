@@ -78,6 +78,7 @@ func (s RepoChartSource) CleanRepoURL() string {
 type HelmReleaseSpec struct {
 	ChartSource      `json:"chart"`
 	ReleaseName      string                    `json:"releaseName,omitempty"`
+	ValueFiles       []string                  `json:"valueFiles,omitempty"`
 	ValueFileSecrets []v1.LocalObjectReference `json:"valueFileSecrets,omitempty"`
 	HelmValues       `json:",inline"`
 	// Install or upgrade timeout in seconds

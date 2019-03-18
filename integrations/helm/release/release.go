@@ -12,9 +12,11 @@ import (
 	"github.com/ghodss/yaml"
 	"github.com/go-kit/kit/log"
 	"github.com/spf13/pflag"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes"
+	k8sclientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/helm/pkg/chartutil"
 	"k8s.io/helm/pkg/getter"
 	k8shelm "k8s.io/helm/pkg/helm"
@@ -147,46 +149,13 @@ func (r *Release) Install(chartPath, releaseName string, fhr flux_v1beta1.HelmRe
 		"options", fmt.Sprintf("%+v", opts),
 		"timeout", fmt.Sprintf("%vs", fhr.GetTimeout()))
 
-	// Read values from given valueFile paths (configmaps, etc.)
-	mergedValues := chartutil.Values{}
-	for _, valueFile := range fhr.Spec.ValueFiles {
-		// Read the contents of the file
-		b, err := readFile(valueFile)
-		if err != nil {
-			r.logger.Log("error", fmt.Sprintf("Cannot read value file [%s] for Chart release [%s]: %#v", valueFile, fhr.Spec.ReleaseName, err))
-			return nil, err
-		}
-
-		// Load into values and merge
-		var values chartutil.Values
-		err = yaml.Unmarshal(b, &values)
-		if err != nil {
-			r.logger.Log("error", fmt.Sprintf("Cannot yaml.Unmarshal value file [%s] for Chart release [%s]: %#v", valueFile, fhr.Spec.ReleaseName, err))
-			return nil, err
-		}
-		mergedValues = mergeValues(mergedValues, values)
+	vals, err := values(fhr.Spec.ValueFiles, fhr.Spec.ValueFileSecrets, fhr.Spec.Values, kubeClient.CoreV1().Secrets(fhr.Namespace))
+	if err != nil {
+		r.logger.Log("error", fmt.Sprintf("Failed to compose values for Chart release [%s]: %#v", fhr.Spec.ReleaseName, err))
+		return nil, err
 	}
-	for _, valueFileSecret := range fhr.Spec.ValueFileSecrets {
-		// Read the contents of the secret
-		secret, err := kubeClient.CoreV1().Secrets(fhr.Namespace).Get(valueFileSecret.Name, v1.GetOptions{})
-		if err != nil {
-			r.logger.Log("error", fmt.Sprintf("Cannot get secret [%s] for Chart release [%s]: %#v", valueFileSecret.Name, fhr.Spec.ReleaseName, err))
-			return nil, err
-		}
 
-		// Load values.yaml file and merge
-		var values chartutil.Values
-		err = yaml.Unmarshal(secret.Data["values.yaml"], &values)
-		if err != nil {
-			r.logger.Log("error", fmt.Sprintf("Cannot yaml.Unmarshal values.yaml in secret [%s] for Chart release [%s]: %#v", valueFileSecret.Name, fhr.Spec.ReleaseName, err))
-			return nil, err
-		}
-		mergedValues = mergeValues(mergedValues, values)
-	}
-	// Merge in values after valueFiles
-	mergedValues = mergeValues(mergedValues, fhr.Spec.Values)
-
-	strVals, err := mergedValues.YAML()
+	strVals, err := vals.YAML()
 	if err != nil {
 		r.logger.Log("error", fmt.Sprintf("Problem with supplied customizations for Chart release [%s]: %#v", fhr.Spec.ReleaseName, err))
 		return nil, err
@@ -292,6 +261,44 @@ func (r *Release) annotateResources(release *hapi_release.Release, fhr flux_v1be
 // fhrResourceID constructs a flux.ResourceID for a HelmRelease resource.
 func fhrResourceID(fhr flux_v1beta1.HelmRelease) flux.ResourceID {
 	return flux.MakeResourceID(fhr.Namespace, "HelmRelease", fhr.Name)
+}
+
+// values tries to resolve all given value file references and merges
+// them into one Values. The merge happens in the following order:
+// value files, value file secrets, values. It returns the Values.
+func values(valueFiles []string, valueFileSecrets []v1.LocalObjectReference, values chartutil.Values, secretAPI k8sclientv1.SecretInterface) (chartutil.Values, error) {
+	var merged chartutil.Values
+
+	for _, filePath := range valueFiles {
+		b, err := readFile(filePath)
+		if err != nil {
+			return merged, fmt.Errorf("unable to read value file: %s", filePath)
+		}
+
+		var valueFile chartutil.Values
+		if err := yaml.Unmarshal(b, &valueFile); err != nil {
+			return merged, fmt.Errorf("unable to yaml.Unmarshal value file: %s", filePath)
+		}
+
+		merged = mergeValues(merged, valueFile)
+	}
+
+	for _, secretRef := range valueFileSecrets {
+		secret, err := secretAPI.Get(secretRef.Name, metav1.GetOptions{})
+		if err != nil {
+			return merged, fmt.Errorf("unable to resolve value file secret: %s", secretRef.Name)
+		}
+
+		var valueFile chartutil.Values
+		if err := yaml.Unmarshal(secret.Data["values.yaml"], &valueFile); err != nil {
+			return merged, fmt.Errorf("unable to yaml.Unmarshal value file secret: %s", secretRef.Name)
+		}
+
+		merged = mergeValues(merged, valueFile)
+	}
+
+	merged = mergeValues(merged, values)
+	return merged, nil
 }
 
 // Merges source and destination `chartutils.Values`, preferring values from the source Values

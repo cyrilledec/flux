@@ -42,6 +42,10 @@ spec:
               type: boolean
             forceUpgrade:
               type: boolean
+            valueFiles:
+              type: array
+              items:
+                type: string
             valueFileSecrets:
               type: array
               properties:
